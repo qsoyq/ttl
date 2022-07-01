@@ -1,32 +1,36 @@
 from __future__ import annotations
 
 import asyncio
+import asyncio as aio
+import threading
 import time
 import uuid
 
 from dataclasses import dataclass, field
 from functools import partial, wraps
+from heapq import heappop, heappush
 from inspect import iscoroutinefunction
 from typing import Any, Callable, List, Optional, Tuple, Union
-from heapq import heappush, heappop
 
-import pytest
-
+TTL = int | float  # 过期时间 单位(秒)
 memo: dict[Tuple[int, int], CacheResult] = {}
 pq: List[PrioritizedItem] = []
+_LOCK = threading.Lock()
+_ALOCK = asyncio.locks.Lock()
 
 
 @dataclass(order=True)
 class PrioritizedItem:
     priority: Union[int, float]
-    item: Tuple[int, int]=field(compare=False)
+    item: Tuple[int, int] = field(compare=False)
 
 
 @dataclass
 class CacheResult:
-    
+
     value: Any
     expire_time: Union[int, float]
+
 
 async def _get_cache(key: Tuple[int, int]):
     return memo.get(key)
@@ -46,6 +50,7 @@ def _make_key(*args, **kwargs) -> int:
             key += item
     return hash(key)
 
+
 def _clear_expired():
     """移除过期条目
 
@@ -61,7 +66,8 @@ def _clear_expired():
         if cache and cache.expire_time < now:
             memo.pop(key)
 
-def ttl_cache(fn: Optional[Callable] = None, *, timeout: Union[int, float] = 2):
+
+def ttl_cache(fn: Optional[Callable] = None, *, timeout: Union[int, float] = 2) -> Callable:
 
     if fn is None:
         return partial(ttl_cache, timeout=timeout)
@@ -70,74 +76,65 @@ def ttl_cache(fn: Optional[Callable] = None, *, timeout: Union[int, float] = 2):
 
         @wraps(fn)
         async def aiowrapper(*args, **kwargs):
-            _clear_expired()
-            now = time.time()
-            key = (id(fn), _make_key(*args, **kwargs))
-            result: Optional[CacheResult] = await _get_cache(key)
-            if result is not None and result.expire_time > now:
-                return result.value
+            async with _ALOCK:
+                _clear_expired()
+                now = time.time()
+                key = (id(fn), _make_key(*args, **kwargs))
+                result: Optional[CacheResult] = await _get_cache(key)
+                if result is not None and result.expire_time > now:
+                    return result.value
 
-            value = await fn(*args, **kwargs)
-            expire_time = now + timeout
-            result = CacheResult(value, expire_time)
-            await _set_cache(key, result)
-            return value
+                value = await fn(*args, **kwargs)
+                expire_time = time.time() + value[1]
+                result = CacheResult(value[0], expire_time)
+                await _set_cache(key, result)
+                return result.value
 
         return aiowrapper
     else:
 
         @wraps(fn)
         def wrapper(*args, **kwargs):
-            _clear_expired()
-            now = time.time()
-            key = (id(fn), _make_key(*args, **kwargs))
-            result: Optional[CacheResult] = asyncio.run(_get_cache(key))
-            if result is not None and result.expire_time > now:
+            with _LOCK:
+                _clear_expired()
+                now = time.time()
+                key = (id(fn), _make_key(*args, **kwargs))
+                result: Optional[CacheResult] = asyncio.run(_get_cache(key))
+                if result is not None and result.expire_time > now:
+                    return result.value
+
+                value = fn(*args, **kwargs)
+                expire_time = time.time() + value[1]
+                result = CacheResult(value[0], expire_time)
+                asyncio.run(_set_cache(key, result))
+                memo[key] = result
+
                 return result.value
 
-            value = fn(*args, **kwargs)
-            expire_time = now + timeout
-            result = CacheResult(value, expire_time)
-            asyncio.run(_set_cache(key, result))
-            memo[key] = result
-
-            return value
-
         return wrapper
-    
+
 
 ttl_cache._raw = memo
 ttl_cache.clear = memo.clear
 ttl_cache.clear_expired = _clear_expired
 
 
-@ttl_cache
-async def uid():
-    return uuid.uuid4().hex
-
-
-@pytest.mark.asyncio
 async def test():
-    # 测试结果保留
-    v = await uid()
-    for _ in range(10):
-        assert v == await uid()
+    cost = 0.1
+    ttl = 0.1
 
-    await asyncio.sleep(1)
-    for _ in range(10):
-        assert v == await uid()
+    @ttl_cache
+    async def foo(a: Any) -> tuple[uuid.UUID, TTL]:
+        await aio.sleep(cost)
+        return uuid.uuid1(), ttl
 
-    await asyncio.sleep(0.5)
-    for _ in range(10):
-        assert v == await uid()
+    task = aio.create_task(foo(0))
+    assert await foo(0) == await task
+    assert isinstance(await task, uuid.UUID)
 
-    await asyncio.sleep(0.5)
-    assert v != await uid()
+    await aio.sleep(ttl)
+    assert await foo(0) != await task
 
-    assert len(ttl_cache._raw) == 1
-    ttl_cache.clear_expired()
-    assert len(ttl_cache._raw) == 1
-    await asyncio.sleep(2)
-    ttl_cache.clear_expired()
-    assert len(ttl_cache._raw) == 0
 
+if __name__ == '__main__':
+    aio.run(test())
